@@ -17,6 +17,12 @@ Design invariants:
   A crash therefore leaves either no download or the complete published archive.
 * A transfer is published at most once; late/duplicate fragments never alter it.
 * Same transfer + same frame number with different content is rejected.
+* Every logical read (one transfer's state, the whole ledger) runs inside a
+  single SQLite read transaction, so registration, received frames, parity,
+  missing frames, verification digest and publish status always come from the
+  same committed moment — even when another instance publishes concurrently.
+  A real transitional state may be visible while publishing; a spliced state
+  that never existed (e.g. pre-publish gaps + post-publish parity) may not.
 """
 
 from __future__ import annotations
@@ -240,6 +246,29 @@ class Storage:
         conn = self._connect()
         try:
             yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def _read_snapshot(self) -> Iterator[sqlite3.Connection]:
+        """One explicit read transaction: every statement sees the same commit.
+
+        In WAL mode a read transaction is a stable snapshot of one committed
+        moment, so registration, received frames, parity and publish status
+        read inside it always belong together. Without this, each SELECT ran
+        on its own autocommit connection and a second instance committing a
+        publication (plus a late parity frame) between two statements could
+        splice pre-publish missing frames with post-publish parity into a
+        state that never existed. Readers never block writers in WAL, so a
+        real transitional state may be shown, but never a mixed one.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            try:
+                yield conn
+            finally:
+                conn.execute("ROLLBACK")  # read-only: just release the snapshot
         finally:
             conn.close()
 
@@ -521,10 +550,21 @@ class Storage:
     # ------------------------------------------------------------------- state
     def state(self, transfer_id: str) -> ArchiveState:
         tid = normalize_transfer_id(transfer_id)
-        row = self._delivery_row(tid)
+        with self._read_snapshot() as conn:
+            row = self._delivery_row_from(conn, tid)
+            return self._state_from_row(conn, row)
+
+    def _state_from_row(self, conn: sqlite3.Connection, row: sqlite3.Row) -> ArchiveState:
+        """Assemble one transfer's state; every read shares ``conn``'s snapshot.
+
+        The caller's connection must be inside a read transaction so the
+        delivery row, frames and parity all come from the same committed
+        moment even while another instance is publishing concurrently.
+        """
         entry = _delivery_from_row(row)
-        frames = self._get_frames(tid)
-        parity = self._get_parity(tid)
+        tid = entry.transfer_id
+        frames = self._frames_from(conn, tid)
+        parity = self._parity_from(conn, tid)
         missing = tuple(
             n for n in range(1, entry.frame_count + 1) if n not in frames
         )
@@ -556,11 +596,13 @@ class Storage:
             return self._after_ingest_locked(tid)
 
     def list_deliveries(self) -> list[ArchiveState]:
-        with self._db() as conn:
+        # One snapshot for the whole ledger: each record (and the counts the
+        # page derives from them) reflects the same committed moment.
+        with self._read_snapshot() as conn:
             rows = conn.execute(
-                "SELECT transfer_id FROM deliveries ORDER BY created_at DESC, transfer_id"
+                "SELECT * FROM deliveries ORDER BY created_at DESC, transfer_id"
             ).fetchall()
-        return [self.state(row["transfer_id"]) for row in rows]
+            return [self._state_from_row(conn, row) for row in rows]
 
     # -------------------------------------------------------------- publication
     def _after_ingest_locked(self, tid: str) -> dict:
@@ -751,9 +793,12 @@ class Storage:
 
     def _delivery_row(self, tid: str) -> sqlite3.Row:
         with self._db() as conn:
-            row = conn.execute(
-                "SELECT * FROM deliveries WHERE transfer_id=?", (tid,)
-            ).fetchone()
+            return self._delivery_row_from(conn, tid)
+
+    def _delivery_row_from(self, conn: sqlite3.Connection, tid: str) -> sqlite3.Row:
+        row = conn.execute(
+            "SELECT * FROM deliveries WHERE transfer_id=?", (tid,)
+        ).fetchone()
         if row is None:
             raise NotFoundError(f"传输号 {tid} 未登记")
         return row
@@ -764,40 +809,43 @@ class Storage:
 
     def _get_frame(self, tid: str, frame_no: int) -> bytes | None:
         with self._db() as conn:
-            row = conn.execute(
-                "SELECT payload, sha256 FROM frames WHERE transfer_id=? AND frame_no=?",
-                (tid, frame_no),
-            ).fetchone()
+            return self._frame_from(conn, tid, frame_no)
+
+    def _frame_from(self, conn: sqlite3.Connection, tid: str, frame_no: int) -> bytes | None:
+        row = conn.execute(
+            "SELECT payload, sha256 FROM frames WHERE transfer_id=? AND frame_no=?",
+            (tid, frame_no),
+        ).fetchone()
         if row is None:
             return None
-        payload = bytes(row["payload"])
-        if hashlib.sha256(payload).hexdigest() != row["sha256"]:
-            raise ConflictError(f"第 {frame_no} 帧存储内容校验失败，请重新上传")
-        return payload
+        return self._checked_payload(row, f"第 {frame_no} 帧")
 
-    def _get_frames(self, tid: str) -> dict[int, bytes]:
-        with self._db() as conn:
-            rows = conn.execute(
-                "SELECT frame_no, payload, sha256 FROM frames WHERE transfer_id=?", (tid,)
-            ).fetchall()
+    def _frames_from(self, conn: sqlite3.Connection, tid: str) -> dict[int, bytes]:
+        rows = conn.execute(
+            "SELECT frame_no, payload, sha256 FROM frames WHERE transfer_id=?", (tid,)
+        ).fetchall()
         frames: dict[int, bytes] = {}
         for row in rows:
-            payload = bytes(row["payload"])
-            if hashlib.sha256(payload).hexdigest() != row["sha256"]:
-                raise ConflictError(f"第 {row['frame_no']} 帧存储内容校验失败，请重新上传")
-            frames[int(row["frame_no"])] = payload
+            frames[int(row["frame_no"])] = self._checked_payload(row, f"第 {row['frame_no']} 帧")
         return frames
 
     def _get_parity(self, tid: str) -> bytes | None:
         with self._db() as conn:
-            row = conn.execute(
-                "SELECT payload, sha256 FROM parities WHERE transfer_id=?", (tid,)
-            ).fetchone()
+            return self._parity_from(conn, tid)
+
+    def _parity_from(self, conn: sqlite3.Connection, tid: str) -> bytes | None:
+        row = conn.execute(
+            "SELECT payload, sha256 FROM parities WHERE transfer_id=?", (tid,)
+        ).fetchone()
         if row is None:
             return None
+        return self._checked_payload(row, "校验帧")
+
+    @staticmethod
+    def _checked_payload(row: sqlite3.Row, label: str) -> bytes:
         payload = bytes(row["payload"])
         if hashlib.sha256(payload).hexdigest() != row["sha256"]:
-            raise ConflictError("校验帧存储内容校验失败，请重新上传")
+            raise ConflictError(f"{label}存储内容校验失败，请重新上传")
         return payload
 
     @staticmethod
